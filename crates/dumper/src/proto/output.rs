@@ -1,6 +1,6 @@
 use super::{MessageMinimalInfo, cache::TypeCache};
 
-use crate::proto::{NumberType, RETCODE_FIELD_NAME, cache::CachedType, nt};
+use crate::proto::{NumberType, cache::CachedType, is_retcode_field, nt};
 use convert_case::{Case, Casing as _};
 use il2cpp::vm::{metadata_cache, object::Il2CppObject, string::Il2CppString, value::Il2CppValue};
 use indexmap::IndexMap;
@@ -109,7 +109,7 @@ impl Message {
         }
 
         for field in &self.fields {
-            let field_display_name = if field.name == *RETCODE_FIELD_NAME {
+            let field_display_name = if is_retcode_field(&field.name) {
                 "retcode".to_string()
             } else {
                 snake_field(&field.name)
@@ -133,7 +133,7 @@ impl Message {
             ));
 
             for field in &oneof.fields {
-                let field_display_name = if field.name == *RETCODE_FIELD_NAME {
+                let field_display_name = if is_retcode_field(&field.name) {
                     "retcode".to_string()
                 } else {
                     snake_field(&field.name)
@@ -351,7 +351,7 @@ fn process_cmd_id(
                 message.cmd_id = *cmd_id;
                 message.msg_type = if message.fields.iter().any(|field| {
                     let name = snake_field(&field.name);
-                    name == *RETCODE_FIELD_NAME || name == "retcode"
+                    is_retcode_field(&name) || name == "retcode"
                 }) {
                     MessageType::Rsp
                 } else {

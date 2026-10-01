@@ -414,7 +414,10 @@ fn handle_map_field(
         }
         "System.Single" => arguments_ptr.push(Box::into_raw(Box::new(10.0f32)) as usize),
         "System.Double" => arguments_ptr.push(Box::into_raw(Box::new(10.0f64)) as usize),
-        other => panic!("invalid map key {other}"),
+        other => {
+            log::warn!("[Proto Dumper | WriteTo] unsupported map key type {other}, skipping field");
+            return None;
+        }
     }
 
     // Set value
@@ -452,9 +455,16 @@ fn try_and_see(
 ) -> Option<(u32, *const usize, WireType)> {
     let cos = CodedOutputStream::new();
 
-    write_to
+    if write_to
         .invoke::<Void>(proto_object, &[&cos.object])
-        .unwrap();
+        .is_err()
+    {
+        log::debug!(
+            "[Proto Dumper | WriteTo] WriteTo threw for {} while probing a {field_type_name} field",
+            proto_object.get_class().byval_arg().il_name()
+        );
+        return None;
+    }
 
     let buf = cos.buffer();
 
@@ -466,7 +476,7 @@ fn try_and_see(
 
     let mut buf = Cursor::new(buf);
 
-    if let Some(key) = decode_varint(&mut buf) {
+    if let Some(key) = decode_varint(&mut buf).filter(|key| *key >> 3 != 0) {
         let field_number = (key >> 3) as u32;
         let wire_type = unsafe { std::mem::transmute::<u64, WireType>(key & 0x07) };
         let tag = field_number << 3;

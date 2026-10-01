@@ -96,12 +96,10 @@ impl CodedOutputStream {
         }
     }
 
+    /// Whole backing buffer; unwritten bytes are zero. Not truncated at the first zero
+    /// byte because encoded payloads (fixed32/64, floats) legitimately contain zeros.
     pub fn buffer(&self) -> Vec<u8> {
-        self.buffer
-            .to_vec::<u8>()
-            .into_iter()
-            .take_while(|value| *value != 0)
-            .collect::<Vec<_>>()
+        self.buffer.to_vec::<u8>()
     }
 }
 

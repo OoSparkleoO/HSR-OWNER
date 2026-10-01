@@ -1,7 +1,6 @@
 use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, OpKind};
 use il2cpp::get_native_method;
 use std::sync::LazyLock;
-use utils::game_assembly_slice;
 
 use super::{FieldMinimalInfo, NumberType};
 
@@ -29,10 +28,9 @@ pub fn dump_from_write_to_asm(
 
     let write_to_rva = write_to_method.rva();
 
-    let slice = game_assembly_slice();
     let mut decoder = Decoder::with_ip(
         64,
-        &slice[write_to_rva..],
+        crate::proto::util::code_slice(write_to_rva, None),
         (*il2cpp::GA_BASE + write_to_rva) as u64,
         DecoderOptions::NONE,
     );
