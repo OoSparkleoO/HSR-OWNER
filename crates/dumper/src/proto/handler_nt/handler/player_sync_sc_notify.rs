@@ -41,7 +41,7 @@ pub fn process(type_to_item: &TypeToItemMap) -> HashMap<String, String> {
 
     let slice = game_assembly_slice();
     let ga_base = *il2cpp::GA_BASE;
-    let data = &slice[handler_rva..(handler_rva + 0x23E).min(slice.len())];
+    let data = crate::proto::util::code_slice(handler_rva, Some(0x23E));
     let ip = (ga_base + handler_rva) as u64;
 
     let mut decoder = Decoder::with_ip(64, data, ip, DecoderOptions::NONE);

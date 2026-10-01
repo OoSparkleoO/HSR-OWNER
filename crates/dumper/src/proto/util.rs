@@ -1,4 +1,4 @@
-use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic};
+use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register};
 use il2cpp::vm::{object::Il2CppObject, value::Il2CppValue};
 use indexmap::IndexMap;
 use reflection::{field_info::FieldInfo, runtime_type::RuntimeType};
@@ -47,28 +47,43 @@ pub fn pack_wire_tag(field_id: u32, wire_type: u8) -> u32 {
     (field_id << 3) | (wire_type as u32)
 }
 
-pub fn is_correct_getter(field_offset: usize, getter_rva: usize) -> bool {
+/// Returns GameAssembly code starting at `rva`, optionally capped to `max_len` bytes.
+/// Out-of-range addresses yield an empty slice (and a warning) instead of panicking.
+#[track_caller]
+pub fn code_slice(rva: usize, max_len: Option<usize>) -> &'static [u8] {
     let slice = game_assembly_slice();
-    let mut decoder = Decoder::new(64, &slice[getter_rva..], DecoderOptions::NONE);
+    if rva == 0 || rva >= slice.len() {
+        log::warn!(
+            "[Proto Dumper] rva 0x{rva:X} is outside GameAssembly (size 0x{:X}), skipping disassembly at {}",
+            slice.len(),
+            std::panic::Location::caller()
+        );
+        return &[];
+    }
 
+    let end = max_len.map_or(slice.len(), |len| rva.saturating_add(len).min(slice.len()));
+    &slice[rva..end]
+}
+
+const GETTER_MAX_INSTRUCTIONS: usize = 32;
+
+pub fn is_correct_getter(field_offset: usize, getter_rva: usize) -> bool {
+    let mut decoder = Decoder::new(64, code_slice(getter_rva, None), DecoderOptions::NONE);
     let mut instruction = Instruction::default();
-    let mut output = String::new();
 
-    while decoder.can_decode() {
+    for _ in 0..GETTER_MAX_INSTRUCTIONS {
+        if !decoder.can_decode() {
+            break;
+        }
         decoder.decode_out(&mut instruction);
-        output.clear();
 
         match instruction.mnemonic() {
-            Mnemonic::Ret => break,
-            Mnemonic::Mov | Mnemonic::Movzx | Mnemonic::Movss | Mnemonic::Movsd => {
-                let displacement_64 = instruction.memory_displacement64();
-                let displacement = if displacement_64 == 0 {
-                    instruction.memory_displacement32() as usize
-                } else {
-                    displacement_64 as usize
-                };
-
-                return displacement == field_offset;
+            Mnemonic::Ret | Mnemonic::Int3 | Mnemonic::Jmp => break,
+            Mnemonic::Mov | Mnemonic::Movzx | Mnemonic::Movss | Mnemonic::Movsd
+                if instruction.op1_kind() == OpKind::Memory
+                    && !matches!(instruction.memory_base(), Register::RIP | Register::None) =>
+            {
+                return instruction.memory_displacement64() as usize == field_offset;
             }
             _ => {}
         }
@@ -248,4 +263,12 @@ pub fn map_oneof_enum_getter(fields: &mut Vec<FieldInfo>) -> (Vec<usize>, Vec<(u
 
 pub fn is_obf(s: &str) -> bool {
     s.len() == 11 && s.chars().all(char::is_uppercase)
+}
+
+pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_string())
 }

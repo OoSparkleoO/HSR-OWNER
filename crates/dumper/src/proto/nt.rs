@@ -23,45 +23,99 @@ use reflection::{field_info::FieldInfo, runtime_type::RuntimeType};
 use std::borrow::Cow;
 use utils::game_assembly_slice;
 
-pub fn get_rsp_notify_map() -> HashMap<RuntimeType, u16> {
-    let mut process = false;
+const RSP_NOTIFY_DICT_TYPE: &str = "Dictionary<RuntimeTypeHandle, ushort>";
+/// How many typedefs after `NotifyType` are searched for the CmdId dictionary holder.
+const RSP_NOTIFY_SEARCH_WINDOW: u32 = 8;
 
-    let mut typedef_index = unsafe { il2cpp::ASSEMBLY_CSHARP_START };
-    for _ in unsafe { typedef_index..il2cpp::MAX_TYPEDEFINDEX } {
-        let class = metadata_cache::get_typeinfo_from_typedefindex(typedef_index);
-        let runtime_type = RuntimeType::from_class(class).unwrap();
-        if runtime_type.get_name().unwrap().as_str() == "NotifyType" {
-            typedef_index += 2;
-            process = true;
-            continue;
-        }
+fn find_rsp_notify_dict_field(runtime_type: RuntimeType) -> Option<FieldInfo> {
+    runtime_type.get_fields(62).into_iter().find(|v| {
+        v.get_field_type()
+            .is_ok_and(|ty| ty.format_type_name(true) == RSP_NOTIFY_DICT_TYPE)
+    })
+}
 
-        if process {
-            if let Some(dictionary) = runtime_type
-                .get_fields(62)
-                .iter()
-                .find(|v| {
-                    v.get_field_type().unwrap().format_type_name(true)
-                        == "Dictionary<RuntimeTypeHandle, ushort>"
-                })
-                .map(|v| v.get_value(Il2CppObject::NULL).unwrap())
-            {
-                let dict = unsafe { *(dictionary.0 as *const Dictionary<Il2CppType, u16>) };
-
-                return dict
-                    .iter()
-                    .map(|(ty, cmdid)| (RuntimeType::from_il2cpp_type(ty).unwrap(), cmdid))
-                    .collect();
-            }
-            log::debug!("[Proto Dumper] cannot find nt field!");
-
-            break;
-        }
-
-        typedef_index += 1;
-        continue;
+fn read_rsp_notify_dict(
+    holder: RuntimeType,
+    field: FieldInfo,
+) -> Option<HashMap<RuntimeType, u16>> {
+    let holder_name = holder.il_name();
+    let Ok(dictionary) = field.get_value(Il2CppObject::NULL) else {
+        log::error!("[Proto Dumper] failed to read CmdId dictionary from {holder_name}");
+        return None;
+    };
+    if dictionary.0 == 0 {
+        log::error!(
+            "[Proto Dumper] CmdId dictionary on {holder_name} is null (static constructor not run yet? try again after logging in)"
+        );
+        return None;
     }
 
+    let dict = unsafe { *(dictionary.0 as *const Dictionary<Il2CppType, u16>) };
+    let map = dict
+        .iter()
+        .filter_map(|(ty, cmdid)| RuntimeType::from_il2cpp_type(ty).ok().map(|rt| (rt, cmdid)))
+        .collect::<HashMap<_, _>>();
+    log::debug!(
+        "[Proto Dumper] rsp/notify CmdIds: {} entries from {holder_name}",
+        map.len()
+    );
+    Some(map)
+}
+
+pub fn get_rsp_notify_map() -> HashMap<RuntimeType, u16> {
+    let (start, end) = unsafe { (il2cpp::ASSEMBLY_CSHARP_START, il2cpp::MAX_TYPEDEFINDEX) };
+    let type_at = |index: u32| {
+        RuntimeType::from_class(metadata_cache::get_typeinfo_from_typedefindex(index)).ok()
+    };
+
+    let notify_type_index = (start..end).find(|&index| {
+        type_at(index)
+            .and_then(|rt| rt.get_name().ok())
+            .is_some_and(|name| name.as_str() == "NotifyType")
+    });
+
+    // Fast path: the holder class sits right after `NotifyType`.
+    if let Some(notify_index) = notify_type_index {
+        let window_end = notify_index
+            .saturating_add(RSP_NOTIFY_SEARCH_WINDOW + 1)
+            .min(end);
+        for index in notify_index + 1..window_end {
+            if let Some(rt) = type_at(index)
+                && let Some(field) = find_rsp_notify_dict_field(rt)
+            {
+                if index != notify_index + 2 {
+                    log::warn!(
+                        "[Proto Dumper] CmdId dictionary found at NotifyType+{}, expected +2",
+                        index - notify_index
+                    );
+                }
+                if let Some(map) = read_rsp_notify_dict(rt, field) {
+                    return map;
+                }
+            }
+        }
+        log::warn!(
+            "[Proto Dumper] no `{RSP_NOTIFY_DICT_TYPE}` field within {RSP_NOTIFY_SEARCH_WINDOW} types after NotifyType (#{notify_index}), scanning Assembly-CSharp"
+        );
+    } else {
+        log::warn!(
+            "[Proto Dumper] NotifyType not found, scanning Assembly-CSharp for CmdId dictionary"
+        );
+    }
+
+    // Slow path: any static `Dictionary<RuntimeTypeHandle, ushort>` in Assembly-CSharp.
+    for index in start..end {
+        if let Some(rt) = type_at(index)
+            && let Some(field) = find_rsp_notify_dict_field(rt)
+            && let Some(map) = read_rsp_notify_dict(rt, field)
+        {
+            return map;
+        }
+    }
+
+    log::error!(
+        "[Proto Dumper] cannot find `{RSP_NOTIFY_DICT_TYPE}` CmdId dictionary; ScRsp/Notify CmdIds will be missing"
+    );
     HashMap::new()
 }
 
@@ -86,7 +140,10 @@ fn get_req_method_va_name_map() -> HashMap<usize, String> {
         };
 
         for method in methods {
-            if method.class().byval_arg().il_name() == *XLUA_OBJECT_TRANSLATOR_METHOD_CLASS {
+            if XLUA_OBJECT_TRANSLATOR_METHOD_CLASS
+                .as_ref()
+                .is_ok_and(|class| method.class().byval_arg().il_name() == *class)
+            {
                 continue;
             }
 
@@ -97,41 +154,68 @@ fn get_req_method_va_name_map() -> HashMap<usize, String> {
     output
 }
 
-fn disasm_obf_deobf_method_by_xlua_obj_translator() -> HashMap<String, String> {
-    let mut output = HashMap::new();
+struct XLuaAnchors {
+    delegate_type_rva: usize,
+    obj_translator_fields: HashMap<usize, String>,
+    register_object_rva: usize,
+}
 
-    let delegate_class = get_cached_class(&XLUA_OBJECT_TRANSLATOR_DELEGATE).unwrap();
-    let delegate_type_rva = *TYPE_INFOS.get().unwrap().get(&delegate_class).unwrap();
+fn resolve_xlua_anchors() -> Result<XLuaAnchors, String> {
+    let delegate_name = XLUA_OBJECT_TRANSLATOR_DELEGATE.clone()?;
+    let static_fields_name = XLUA_OBJECT_TRANSLATOR_STATIC_FIELDS_CLASS.clone()?;
+    let register_object_rva = XLUA_REGISTER_OBJECT_RVA.clone()?;
 
-    let obj_translator_fields_class =
-        get_cached_class(&XLUA_OBJECT_TRANSLATOR_STATIC_FIELDS_CLASS).unwrap();
-    let obj_translator_fields = obj_translator_fields_class
+    let delegate_class = get_cached_class(&delegate_name)
+        .ok_or_else(|| format!("delegate class `{delegate_name}` not found"))?;
+    let delegate_type_rva = *TYPE_INFOS
+        .get()
+        .ok_or("TYPE_INFOS is not initialized")?
+        .get(&delegate_class)
+        .ok_or_else(|| format!("no TypeInfo RVA for `{delegate_name}`"))?;
+
+    let obj_translator_fields = get_cached_class(&static_fields_name)
+        .ok_or_else(|| format!("class `{static_fields_name}` not found"))?
         .get_fields()
         .into_iter()
-        .map(|v| {
-            (
-                v.offset(),
-                strip_prefixes(
-                    FieldInfo::from_il2cpp_field(v)
-                        .unwrap()
-                        .get_name()
-                        .unwrap()
-                        .as_str()
-                        .split_once("__")
-                        .map(|(_, rest)| rest)
-                        .unwrap(),
-                    &["Send"],
-                )
-                .to_string(),
-            )
+        .filter_map(|v| {
+            let field_name = FieldInfo::from_il2cpp_field(v).ok()?.get_name().ok()?;
+            let field_name = field_name.as_str();
+            let (_, rest) = field_name.split_once("__")?;
+            Some((v.offset(), strip_prefixes(rest, &["Send"]).to_string()))
         })
         .collect::<HashMap<_, _>>();
 
-    let slice = game_assembly_slice();
-    let xlua_register_object_rva = *XLUA_REGISTER_OBJECT_RVA;
+    if obj_translator_fields.is_empty() {
+        return Err(format!(
+            "`{static_fields_name}` has no `__`-prefixed static fields"
+        ));
+    }
+
+    Ok(XLuaAnchors {
+        delegate_type_rva,
+        obj_translator_fields,
+        register_object_rva,
+    })
+}
+
+fn disasm_obf_deobf_method_by_xlua_obj_translator() -> HashMap<String, String> {
+    let mut output = HashMap::new();
+
+    let XLuaAnchors {
+        delegate_type_rva,
+        obj_translator_fields,
+        register_object_rva: xlua_register_object_rva,
+    } = match resolve_xlua_anchors() {
+        Ok(anchors) => anchors,
+        Err(err) => {
+            log::error!("[Proto Dumper] xLua name recovery disabled: {err}");
+            return output;
+        }
+    };
+
     let mut decoder = Decoder::with_ip(
         64,
-        &slice[xlua_register_object_rva..],
+        crate::proto::util::code_slice(xlua_register_object_rva, None),
         *GA_BASE as u64 + xlua_register_object_rva as u64,
         DecoderOptions::NONE,
     );
@@ -232,6 +316,10 @@ fn disasm_obf_deobf_method_by_xlua_obj_translator() -> HashMap<String, String> {
         instructions.push_back(instruction);
     }
 
+    log::debug!(
+        "[Proto Dumper] xLua obf->deobf method names: {}",
+        output.len()
+    );
     output
 }
 
@@ -252,22 +340,45 @@ pub fn get_req_map(
         })
         .collect::<HashSet<_>>();
 
-    let networkmanager_send_va = get_native_method(&format!(
-        "RPG.Client.NetworkManager::{}(System.UInt16,Google.Protobuf.IMessage,System.Boolean)",
-        *NETWORK_MANAGER_SEND_NAME
-    ))
-    .unwrap()
-    .va();
-    let networkmanager_send_va2 = *NETWORK_MANAGER_SEND_VA;
-    let networkmanager_send_va3 = *FIGHT_GAME_SEND;
-
     let mut targets = HashMap::with_capacity(3);
 
-    targets.insert(networkmanager_send_va, ReqFlavor::Standard);
-    targets.insert(networkmanager_send_va2, ReqFlavor::Standard);
-    targets.insert(networkmanager_send_va3, ReqFlavor::Fight);
+    match NETWORK_MANAGER_SEND_NAME.as_ref() {
+        Ok(name) => {
+            let signature = format!(
+                "RPG.Client.NetworkManager::{name}(System.UInt16,Google.Protobuf.IMessage,System.Boolean)"
+            );
+            match get_native_method(&signature) {
+                Some(method) => {
+                    targets.insert(method.va(), ReqFlavor::Standard);
+                }
+                None => log::error!("[Proto Dumper] native method `{signature}` not found"),
+            }
+        }
+        Err(_) => log::warn!("[Proto Dumper] NetworkManager::Send unavailable, skipping it"),
+    }
+    if let Ok(va) = *NETWORK_MANAGER_SEND_VA {
+        targets.insert(va, ReqFlavor::Standard);
+    }
+    if let Ok(va) = *FIGHT_GAME_SEND {
+        targets.insert(va, ReqFlavor::Fight);
+    }
 
-    disasm_all_req(&type_info_rvas, targets, rsp_notify_map, req_map)
+    if targets.is_empty() {
+        log::error!("[Proto Dumper] no Send function resolved; CsReq CmdIds will be missing");
+        return HashMap::new();
+    }
+    log::debug!(
+        "[Proto Dumper] scanning GameAssembly for calls to {} Send function(s)",
+        targets.len()
+    );
+
+    let result = disasm_all_req(&type_info_rvas, targets, rsp_notify_map, req_map);
+    if req_map.is_empty() {
+        log::error!(
+            "[Proto Dumper] Send call sites were scanned but no CsReq CmdId was recovered; the call-site register pattern may have changed"
+        );
+    }
+    result
 }
 
 #[derive(Debug, Eq, PartialEq, Clone, Copy)]
@@ -354,7 +465,7 @@ fn disasm_all_req(
                 }
             }
             if let Some(push_index) = last_push_index {
-                push_rva = Some(instructions[push_index].ip() as usize - *GA_BASE);
+                push_rva = Some((instructions[push_index].ip() as usize).wrapping_sub(*GA_BASE));
             }
 
             for i in (0..instructions.len()).rev() {
@@ -431,9 +542,11 @@ fn disasm_all_req(
                         && (inst.mnemonic() == Mnemonic::Call || inst.mnemonic() == Mnemonic::Jmp)
                     {
                         let target_va = inst.near_branch_target() as usize;
-                        if target_va - *GA_BASE == *IL2CPP_OBJECT_NEW_RVA {
-                            let va = instructions[i - 1].memory_displacement64() as usize;
-                            if type_info_rvas.contains(&(va - *GA_BASE)) {
+                        if target_va.wrapping_sub(*GA_BASE) == *IL2CPP_OBJECT_NEW_RVA
+                            && let Some(prev) = i.checked_sub(1).map(|p| instructions[p])
+                        {
+                            let va = prev.memory_displacement64() as usize;
+                            if type_info_rvas.contains(&va.wrapping_sub(*GA_BASE)) {
                                 let class = unsafe { *(va as *const Il2CppClass) };
                                 if let Ok(rt) = RuntimeType::from_class(class) {
                                     let deobf_name = cur_func_va
@@ -470,7 +583,7 @@ fn disasm_all_req(
                                     && prev.op0_register() == type_info_reg
                                 {
                                     let va = prev.memory_displacement64() as usize;
-                                    if type_info_rvas.contains(&(va - *GA_BASE)) {
+                                    if type_info_rvas.contains(&va.wrapping_sub(*GA_BASE)) {
                                         let class = unsafe { *(va as *const Il2CppClass) };
                                         if let Ok(rt) = RuntimeType::from_class(class) {
                                             let deobf_name = cur_func_va.and_then(|v| {
@@ -519,7 +632,12 @@ fn disasm_all_req(
 }
 
 pub fn get_rsp_notify_names() -> HashMap<String, String> {
-    let cached_methods = FUNCTIONS_TABLE_REFLECTION.get().unwrap();
+    let Some(cached_methods) = FUNCTIONS_TABLE_REFLECTION.get() else {
+        log::error!(
+            "[Proto Dumper] FUNCTIONS_TABLE_REFLECTION is not initialized, skipping rsp/notify names"
+        );
+        return HashMap::new();
+    };
     let prefixes_to_replace = ["_OnCmd", "_Cmd", "_On", "OnCmd", "On", "Cmd"];
 
     let mut nt_map = HashMap::new();
@@ -554,7 +672,12 @@ pub fn get_rsp_notify_names() -> HashMap<String, String> {
 }
 
 pub fn get_rsp_notify_method_rvas() -> HashMap<String, Vec<String>> {
-    let cached_methods = FUNCTIONS_TABLE_REFLECTION.get().unwrap();
+    let Some(cached_methods) = FUNCTIONS_TABLE_REFLECTION.get() else {
+        log::error!(
+            "[Proto Dumper] FUNCTIONS_TABLE_REFLECTION is not initialized, skipping rsp/notify handlers"
+        );
+        return HashMap::new();
+    };
     let prefixes_to_replace = ["_OnCmd", "_Cmd", "_On", "OnCmd", "On", "Cmd"];
 
     let mut rva_map: HashMap<String, Vec<String>> = HashMap::new();
@@ -591,10 +714,9 @@ pub fn get_rsp_notify_method_rvas() -> HashMap<String, Vec<String>> {
 }
 
 fn disasm_rsp_notify_3_args(rva: usize) -> Option<Il2CppClass> {
-    let slice = game_assembly_slice();
     let mut decoder = Decoder::with_ip(
         64,
-        &slice[rva..],
+        crate::proto::util::code_slice(rva, None),
         (*GA_BASE + rva) as u64,
         DecoderOptions::NONE,
     );

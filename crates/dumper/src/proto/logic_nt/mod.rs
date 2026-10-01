@@ -32,6 +32,8 @@ pub fn run_logic_nt(
             .map(|(k, v)| format!("{k} {v}"))
             .collect::<Vec<_>>()
             .join("\n");
-        std::fs::write("./DUMP/nt.txt", output_content).expect("failed to write nt.txt");
+        if let Err(err) = std::fs::write("./DUMP/nt.txt", output_content) {
+            log::error!("[Logic NT] failed to write ./DUMP/nt.txt: {err}");
+        }
     }
 }

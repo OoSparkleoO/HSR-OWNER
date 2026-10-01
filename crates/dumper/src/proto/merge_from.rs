@@ -60,9 +60,14 @@ pub fn dump_merge_from(
     type_cache: &TypeCache,
 ) {
     let name = proto_instance.get_class().byval_arg().il_name();
-    let merge_from_method =
+    let Some(merge_from_method) =
         get_native_method(&format!("{name}::{MERGE_FROM}({CODED_INPUT_STREAM})"))
-            .unwrap_or_else(|| panic!("{name}::{MERGE_FROM}({CODED_INPUT_STREAM})"));
+    else {
+        log::error!(
+            "[Proto Dumper | MergeFrom] native `{name}::{MERGE_FROM}({CODED_INPUT_STREAM})` not found"
+        );
+        return;
+    };
 
     let mut detector = ChangeDetector::new(type_cache, proto_instance);
     let scan_all = proto_type
@@ -289,7 +294,14 @@ impl ChangeDetector {
                     }),
                 })
             }
-            _ => panic!("abnormal number of fields changed: {}", changed.len()),
+            _ => {
+                log::warn!(
+                    "[Proto Dumper | MergeFrom] {} fields changed at once on {}, ignoring this probe",
+                    changed.len(),
+                    self.object.get_class().byval_arg().il_name()
+                );
+                Input::Unchanged
+            }
         }
     }
 

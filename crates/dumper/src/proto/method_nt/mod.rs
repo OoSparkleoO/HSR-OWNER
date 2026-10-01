@@ -46,9 +46,10 @@ pub fn get_method_nt_map() -> (HashMap<String, Vec<String>>, HashMap<String, Str
     let param_count = param_output.len();
     let output_lines: Vec<String> = param_output.into_iter().chain(method_output).collect();
 
-    if !output_lines.is_empty() {
-        std::fs::write("./DUMP/method_nt.txt", output_lines.join("\n"))
-            .expect("Failed to write method_nt.txt");
+    if !output_lines.is_empty()
+        && let Err(err) = std::fs::write("./DUMP/method_nt.txt", output_lines.join("\n"))
+    {
+        log::error!("[Method NT] failed to write ./DUMP/method_nt.txt: {err}");
     }
 
     log::debug!(
