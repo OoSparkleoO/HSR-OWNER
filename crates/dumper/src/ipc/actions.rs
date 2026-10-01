@@ -30,6 +30,16 @@ pub fn ensure_dump_folder() -> std::io::Result<()> {
 }
 
 fn dump_proto(mode: ProtoDumpMode) -> anyhow::Result<()> {
+    if script::TYPE_INFOS.get().is_none() || script::METADATA_METHODS.get().is_none() {
+        log::debug!("[Proto Dumper] script metadata not loaded yet, running Script dumper first");
+        script::dump();
+        if script::TYPE_INFOS.get().is_none() || script::METADATA_METHODS.get().is_none() {
+            log::error!(
+                "[Proto Dumper] Script dumper did not initialize TYPE_INFOS/METADATA_METHODS; CsReq CmdIds will be missing"
+            );
+        }
+    }
+
     proto::dump(
         &mut std::fs::File::create("./DUMP/StarRail.proto")?,
         &mut std::fs::File::create("./DUMP/packetIds.json")?,

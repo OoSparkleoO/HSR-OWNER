@@ -56,11 +56,15 @@ fn previous_class_name(class_name: &str) -> AnchorResult<Cow<'static, str>> {
     let prev_idx = idx
         .checked_sub(1)
         .ok_or_else(|| format!("`{class_name}` is the first entry of CLASS_TABLE_VEC"))?;
-    Ok(
-        metadata_cache::get_typeinfo_from_typedefindex(prev_idx as u32)
-            .byval_arg()
-            .il_name(),
-    )
+    let name = metadata_cache::get_typeinfo_from_typedefindex(prev_idx as u32)
+        .byval_arg()
+        .il_name();
+    if name.is_empty() {
+        return Err(format!(
+            "class before `{class_name}` (typedef index {prev_idx}) has an empty name; the class layout may have changed"
+        ));
+    }
+    Ok(name)
 }
 
 const IL2CPP_OBJECT_NEW_API_INDEX: usize = 130;
@@ -261,9 +265,10 @@ pub static FIGHT_GAME_SEND: LazyLock<AnchorResult<usize>> = LazyLock::new(|| {
             .get_field_type()
             .map_err(|_| "failed to read s_MultiplayerManager field type".to_string())?;
 
-        for method in multiplayer_manager.get_methods_il2cpp() {
+        let methods = multiplayer_manager.get_methods_il2cpp();
+        for method in &methods {
             let params = method.get_parameters();
-            if params.len() == 3
+            if params.len() >= 3
                 && params[1]
                     .get_parameter_type()
                     .is_ok_and(|ty| ty.il_name() == "System.UInt16")
@@ -276,9 +281,37 @@ pub static FIGHT_GAME_SEND: LazyLock<AnchorResult<usize>> = LazyLock::new(|| {
             }
         }
 
+        let signatures = methods
+            .iter()
+            .filter(|method| {
+                method.get_parameters().iter().any(|param| {
+                    param
+                        .get_parameter_type()
+                        .is_ok_and(|ty| ty.il_name() == "System.UInt16")
+                })
+            })
+            .map(|method| {
+                let name = method
+                    .get_name()
+                    .map_or_else(|_| "<unknown>".to_string(), |n| n.as_str().to_string());
+                let params = method
+                    .get_parameters()
+                    .iter()
+                    .map(|param| {
+                        param
+                            .get_parameter_type()
+                            .map_or_else(|_| "?".to_string(), |ty| ty.il_name().to_string())
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{name}({params})")
+            })
+            .collect::<Vec<_>>();
         Err(format!(
-            "no `(_, System.UInt16, _)` method on `{}`",
-            multiplayer_manager.il_name()
+            "no `(_, System.UInt16, _, ...)` method on `{}` ({} methods); methods taking UInt16: [{}]",
+            multiplayer_manager.il_name(),
+            methods.len(),
+            signatures.join("; ")
         ))
     })
 });
