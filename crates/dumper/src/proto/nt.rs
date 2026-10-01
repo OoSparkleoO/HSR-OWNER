@@ -328,16 +328,18 @@ pub fn get_req_map(
     rsp_notify_map: &HashMap<RuntimeType, u16>,
     req_map: &mut HashMap<RuntimeType, (u16, Option<String>)>,
 ) -> HashMap<RuntimeType, Vec<String>> {
+    let Some(type_infos) = TYPE_INFOS.get() else {
+        log::error!(
+            "[Proto Dumper] TYPE_INFOS is not initialized (run the Script dumper first); CsReq CmdIds will be missing"
+        );
+        return HashMap::new();
+    };
     let type_info_rvas = minimal_info
         .iter()
-        .filter(|(ty, _)| !ty.get_isenum().unwrap().unbox() && !rsp_notify_map.contains_key(ty))
-        .filter_map(|(ty, _)| {
-            TYPE_INFOS
-                .get()
-                .unwrap()
-                .get(&ty.get_il2cpp_type().get_class())
-                .copied()
+        .filter(|(ty, _)| {
+            !ty.get_isenum().is_ok_and(|v| v.unbox()) && !rsp_notify_map.contains_key(ty)
         })
+        .filter_map(|(ty, _)| type_infos.get(&ty.get_il2cpp_type().get_class()).copied())
         .collect::<HashSet<_>>();
 
     let mut targets = HashMap::with_capacity(3);
@@ -368,8 +370,15 @@ pub fn get_req_map(
         return HashMap::new();
     }
     log::debug!(
-        "[Proto Dumper] scanning GameAssembly for calls to {} Send function(s)",
-        targets.len()
+        "[Proto Dumper] scanning GameAssembly for calls to {} Send function(s): [{}], req type infos={}, il2cpp_object_new=0x{:X}",
+        targets.len(),
+        targets
+            .iter()
+            .map(|(va, flavor)| format!("0x{:X} {flavor:?}", va.wrapping_sub(*GA_BASE)))
+            .collect::<Vec<_>>()
+            .join(", "),
+        type_info_rvas.len(),
+        *IL2CPP_OBJECT_NEW_RVA
     );
 
     let result = disasm_all_req(&type_info_rvas, targets, rsp_notify_map, req_map);
@@ -385,6 +394,38 @@ pub fn get_req_map(
 enum ReqFlavor {
     Standard, // DX, R8
     Fight,    // R8, R9
+}
+
+const MAX_UNMATCHED_SAMPLES: usize = 16;
+
+#[derive(Default)]
+struct ReqScanStats {
+    call_sites: usize,
+    with_cmd_id: usize,
+    with_object: usize,
+    identified: usize,
+    unmatched_samples: Vec<String>,
+}
+
+fn is_cmd_id_register(flavor: ReqFlavor, reg: Register) -> bool {
+    match flavor {
+        ReqFlavor::Standard => matches!(reg, Register::DX | Register::EDX | Register::RDX),
+        ReqFlavor::Fight => matches!(reg, Register::R8W | Register::R8D | Register::R8),
+    }
+}
+
+fn immediate_cmd_id(inst: &Instruction) -> Option<u16> {
+    match inst.op1_kind() {
+        OpKind::Immediate8
+        | OpKind::Immediate16
+        | OpKind::Immediate32
+        | OpKind::Immediate64
+        | OpKind::Immediate8to16
+        | OpKind::Immediate8to32
+        | OpKind::Immediate8to64
+        | OpKind::Immediate32to64 => u16::try_from(inst.immediate(1)).ok(),
+        _ => None,
+    }
 }
 
 fn disasm_all_req(
@@ -435,6 +476,7 @@ fn disasm_all_req(
     type CandidateInfo = (HashSet<u16>, HashSet<Option<String>>, Vec<String>);
     let mut candidates: HashMap<RuntimeType, CandidateInfo> = HashMap::new();
     let mut cur_func_va = None;
+    let mut stats = ReqScanStats::default();
 
     while decoder.can_decode() {
         decoder.decode_out(&mut instruction);
@@ -454,6 +496,8 @@ fn disasm_all_req(
             let mut cmd_id = None;
             let mut push_rva = None;
             let mut last_push_index = None;
+            let mut identified = false;
+            stats.call_sites += 1;
 
             let mut i = instructions.len();
             while i > 0 {
@@ -476,16 +520,12 @@ fn disasm_all_req(
 
                 // 1: CmdId
                 if cmd_id.is_none() && inst.mnemonic() == Mnemonic::Mov {
-                    let reg = inst.op0_register();
-                    let is_match = match flavor {
-                        ReqFlavor::Standard => reg == Register::DX,
-                        ReqFlavor::Fight => reg == Register::R8 || reg == Register::R8W,
-                    };
-                    if is_match {
-                        let id = inst.immediate16();
-                        if id != 0 && !rsp_notify_map.values().any(|&v| v == id) {
-                            cmd_id = Some(id);
-                        }
+                    if is_cmd_id_register(flavor, inst.op0_register())
+                        && let Some(id) = immediate_cmd_id(&inst)
+                        && id != 0
+                        && !rsp_notify_map.values().any(|&v| v == id)
+                    {
+                        cmd_id = Some(id);
                     }
                     if cmd_id.is_some() {
                         continue;
@@ -559,6 +599,7 @@ fn disasm_all_req(
                                     if let Some(prva) = push_rva {
                                         entry.2.push(format!("0x{prva:X}"));
                                     }
+                                    identified = true;
                                     break;
                                 }
                             }
@@ -597,6 +638,7 @@ fn disasm_all_req(
                                             if let Some(prva) = push_rva {
                                                 entry.2.push(format!("0x{prva:X}"));
                                             }
+                                            identified = true;
                                             break;
                                         }
                                     }
@@ -609,11 +651,43 @@ fn disasm_all_req(
                     }
                 }
             }
+            if cmd_id.is_some() {
+                stats.with_cmd_id += 1;
+            }
+            if obj_register.is_some() {
+                stats.with_object += 1;
+            }
+            if identified {
+                stats.identified += 1;
+            } else if stats.unmatched_samples.len() < MAX_UNMATCHED_SAMPLES {
+                stats.unmatched_samples.push(format!(
+                    "0x{:X}(cmd_id={}, object={})",
+                    (instruction.ip() as usize).wrapping_sub(*GA_BASE),
+                    cmd_id.map_or_else(|| "-".to_string(), |id| id.to_string()),
+                    obj_register.is_some()
+                ));
+            }
         }
         if instructions.len() >= 500 {
             instructions.pop_front();
         }
         instructions.push_back(instruction);
+    }
+
+    log::debug!(
+        "[Proto Dumper] Send call sites: total={}, with_cmd_id={}, with_object={}, identified={}, distinct_types={}",
+        stats.call_sites,
+        stats.with_cmd_id,
+        stats.with_object,
+        stats.identified,
+        candidates.len()
+    );
+    if !stats.unmatched_samples.is_empty() {
+        log::warn!(
+            "[Proto Dumper] unmatched Send call sites (first {}): {}",
+            stats.unmatched_samples.len(),
+            stats.unmatched_samples.join(", ")
+        );
     }
 
     for (rt, (ids, names, rvas)) in candidates {

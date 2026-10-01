@@ -1,8 +1,9 @@
 use std::{
     collections::{HashMap, VecDeque},
     net::{TcpListener, TcpStream},
+    panic::{AssertUnwindSafe, catch_unwind},
     sync::{
-        Arc, LazyLock, Mutex,
+        Arc, LazyLock, Mutex, Once,
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, SyncSender},
     },
@@ -240,12 +241,48 @@ fn handle_command(responder: &Responder, command: FrontendCommand) {
     }
 }
 
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_string())
+}
+
+/// Routes panic messages and locations into the backend log so they reach the frontend.
+fn install_panic_logger() {
+    static INSTALLED: Once = Once::new();
+    INSTALLED.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let location = info
+                .location()
+                .map_or_else(|| "<unknown>".to_string(), ToString::to_string);
+            log::error!(
+                "[Panic] thread `{}` panicked at {location}: {}",
+                thread::current().name().unwrap_or("<unnamed>"),
+                panic_payload_message(info.payload())
+            );
+            previous(info);
+        }));
+    });
+}
+
 fn handle_dumper(responder: &Responder, action: DumperAction) {
+    install_panic_logger();
     log::debug!("[Tunnel] run dumper: {}", action.label());
     let start = Instant::now();
     responder.reply(BackendEvent::DumperStarted { action });
 
-    match actions::run(action) {
+    let result =
+        catch_unwind(AssertUnwindSafe(|| actions::run(action))).unwrap_or_else(|payload| {
+            Err(anyhow::anyhow!(
+                "dumper panicked: {} (see the [Panic] log line for its location)",
+                panic_payload_message(&*payload)
+            ))
+        });
+
+    match result {
         Ok(()) => {
             let seconds = start.elapsed().as_secs();
             log::debug!("[Tunnel] dumper finished: {} ({seconds}s)", action.label());
